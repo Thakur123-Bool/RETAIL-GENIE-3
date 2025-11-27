@@ -1,3 +1,4 @@
+# Dockerfile.backend (fixed for your structure: backend/app/main.py)
 # Build stage: prepare wheels
 FROM python:3.12-slim AS builder
 
@@ -10,14 +11,14 @@ RUN apt-get update \
       build-essential gcc g++ pkg-config libpq-dev libsnappy-dev zlib1g-dev libzstd-dev rustc cargo unzip curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# upgrade pip and wheel, use cache mounts in modern Docker BuildKit (optional)
+# upgrade pip and wheel
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# Copy requirements into builder
+# Copy the repository's backend requirements into the build context
+# (we expect requirements.txt to be at backend/app/requirements.txt in your repo)
 COPY backend/app/requirements.txt /build/requirements.txt
 
-# Build wheels and store in /wheels
-# Note: this step may require build tools for some packages (deltalake, kaggle, etc.)
+# Build wheels and store them in /wheels
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip wheel --wheel-dir /wheels -r /build/requirements.txt
 
@@ -31,20 +32,22 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates libgomp1 unzip \
  && rm -rf /var/lib/apt/lists/*
 
-# Copy wheels from builder and copy requirements file so pip -r can read it
+# Copy wheels from builder and install without network
 COPY --from=builder /wheels /wheels
-COPY --from=builder /build/requirements.txt /app/requirements.txt
 
-# Install packages from wheels (no network)
+# Copy your application directory. This will create /app/app/main.py
+# so you can import it as Python module `app.main`.
+COPY backend /app
+
+# Install packages from wheels (no network).
+# Use the same requirements file that we used in builder stage:
 RUN python -m pip install --upgrade pip \
- && python -m pip install --no-index --find-links=/wheels --no-cache-dir -r /app/requirements.txt \
+ && python -m pip install --no-index --find-links=/wheels -r /app/app/requirements.txt \
  && rm -rf /wheels /root/.cache/pip
 
-# Copy application code
-COPY backend/app /app
-
-# Avoid shadowing installed packages (ensure you don't have files named msal.py, requests.py, etc.)
+# Ensure gunicorn runs from /app so imports resolve
 ENV PYTHONUNBUFFERED=1
 
-# Example start command (adjust worker count or command if you need)
-CMD ["gunicorn", "app:app", "-b", "0.0.0.0:8000", "--workers", "2"]
+# Run gunicorn and point to app.main:app (module app/main.py -> app.main)
+# --chdir ensures Gunicorn's working dir is /app
+CMD ["gunicorn", "app.main:app", "-b", "0.0.0.0:8000", "--workers", "2", "--chdir", "/app"]
