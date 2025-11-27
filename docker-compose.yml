@@ -1,23 +1,37 @@
 version: '3.8'
+
 services:
   backend:
-    build: .
-    context: .  # Root
-    dockerfile: Dockerfile.backend
+    build:
+      context: .  # Root context
+      dockerfile: Dockerfile.backend
     ports:
-      - "5000:5000"
+      - "5000:5000"  # Backend on 5000
     env_file:
-      - backend/.env
-    volumes:
-      - ./backend/app:/app  # For hot reload in dev
+      - backend/.env  # Loads env vars safely
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
 
   frontend:
     build:
-      context: .
+      context: .  # Root context
       dockerfile: Dockerfile.frontend
     ports:
-      - "3000:80"  # Vite dev on 5173, but prod on 80
+      - "3000:3000"  # Frontend on 3000 (static serve)
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy  # Wait for backend
     environment:
-      - VITE_API_URL=http://backend:5000  # Internal Docker networking
+      - VITE_API_URL=http://backend:5000  # Internal for local Docker
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
