@@ -1,9 +1,9 @@
+# backend/app/main.py
 import os
 import json
-import tempfile 
+import tempfile
 import shutil
 import logging
-import time
 import traceback
 import re
 from pathlib import Path
@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-# Auth libs - keep both options (msal device flow or service principal)
+# Optional/soft imports for features that may not be available in all environments
 try:
     import msal
 except Exception:
@@ -29,74 +29,69 @@ try:
 except Exception:
     ClientSecretCredential = None
 
-# Kaggle
 try:
     from kaggle.api.kaggle_api_extended import KaggleApi
 except Exception:
     KaggleApi = None
 
-# deltalake (may require native deps)
 try:
     from deltalake import write_deltalake
 except Exception:
     write_deltalake = None
 
-# OneLake client
 try:
     from azure.storage.filedatalake import DataLakeServiceClient
 except Exception:
     DataLakeServiceClient = None
 
-load_dotenv()
+# Load environment from .env (only used locally). In production use host env variables.
+_here = os.path.dirname(__file__)
+_env_path = os.path.normpath(os.path.join(_here, "..", ".env"))
+if os.path.exists(_env_path):
+    load_dotenv(_env_path)
+else:
+    load_dotenv()  # fallback to default behavior
 
 # ---------- Config & constants ----------
-# reduce noisy azure/request logging by default; keep warnings+errors visible
+# logging: reduce noisy libs by default but allow info-level messages from this module
 logging.basicConfig(level=logging.WARNING)
 log = logging.getLogger("combined-api")
-# keep module-level logger objects for your own info-level messages
 log.setLevel(logging.INFO)
-
-# also lower some very noisy libraries to WARNING
 logging.getLogger("azure").setLevel(logging.WARNING)
 logging.getLogger("azure.identity").setLevel(logging.WARNING)
 logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
 logging.getLogger("msal").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 
-# Use values from your original code if present
-FABRIC_API = "https://api.fabric.microsoft.com/v1"
+FABRIC_API = os.getenv("FABRIC_API", "https://api.fabric.microsoft.com/v1")
 ONELAKE_DFS = os.getenv("ONELAKE_DFS", "https://onelake.dfs.fabric.microsoft.com")
 DFS_VERSION = os.getenv("DFS_VERSION", "2023-11-03")
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "5000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
-# MSAL names (kept for backwards compatibility)
 TENANT_ID = os.getenv("FABRIC_TENANT_ID") or os.getenv("TENANT_ID") or os.getenv("TENANT")
 CLIENT_ID = os.getenv("FABRIC_CLIENT_ID") or os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")  # optional - if present, use service-principal flow
-
-# Kaggle config
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 KAGGLE_USERNAME = os.getenv("KAGGLE_USERNAME")
 KAGGLE_KEY = os.getenv("KAGGLE_KEY")
-
-ONELAKE_URL = os.getenv("ONELAKE_URL")  # required for DataLakeServiceClient
+ONELAKE_URL = os.getenv("ONELAKE_URL")
 FABRIC_API_BASE = FABRIC_API
 
-# Token cache filenames
-CACHE_FILE = os.getenv("MSAL_CACHE_FILE", "msal_token_cache.bin")
-TOKEN_FILE = os.getenv("FABRIC_TOKEN_FILE", "fabric_bearer_token.txt")
+CACHE_FILE = os.path.join(tempfile.gettempdir(), "msal_token_cache.bin")
+TOKEN_FILE = os.getenv("FABRIC_TOKEN_FILE", os.path.join(tempfile.gettempdir(), "fabric_bearer_token.txt"))
 
-# ---------- Token manager (supports device-flow MSAL and optionally service principal) ----------
 SCOPE_FABRIC = ["https://api.fabric.microsoft.com/.default"]
 SCOPE_STORAGE = ["https://storage.azure.com/.default"]
 
-
+# ---------- Token manager ----------
 class TokenManager:
     """
-    If CLIENT_SECRET present -> uses ClientSecretCredential (service principal).
-    Otherwise falls back to MSAL device-flow (interactive).
+    Token manager that prefers service principal (ClientSecretCredential).
+    If service principal (CLIENT_SECRET) is not configured, initialization raises,
+    because interactive device flow is not suitable for unattended server deployments.
     """
     _instance = None
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
@@ -110,16 +105,19 @@ class TokenManager:
         self.fabric_token: Optional[str] = None
         self.storage_token: Optional[str] = None
         self.expiry: Dict[str, float] = {}
-        self._use_sp = bool(CLIENT_SECRET and CLIENT_ID and TENANT_ID and ClientSecretCredential is not None)
-        if not self._use_sp and msal is None:
-            log.warning("MSAL not available and SERVICE PRINCIPAL not configured - auth may fail.")
 
+        # Use service principal if credentials and azure.identity available
+        self._use_sp = bool(CLIENT_SECRET and CLIENT_ID and TENANT_ID and ClientSecretCredential is not None)
+        if not self._use_sp:
+            # For production non-interactive deployments we require service principal
+            raise RuntimeError("Service principal authentication is required for deployment. "
+                               "Please set CLIENT_SECRET, CLIENT_ID, and TENANT_ID environment variables.")
         if self._use_sp:
             # service principal credential
             self.cred = ClientSecretCredential(tenant_id=TENANT_ID, client_id=CLIENT_ID, client_secret=CLIENT_SECRET)
             log.info("TokenManager: using ClientSecretCredential (service principal).")
         else:
-            # msal public client (device flow)
+            # This branch is only reachable if earlier requirement is removed; kept for completeness
             if msal:
                 self.cache = msal.SerializableTokenCache()
                 if os.path.exists(CACHE_FILE):
@@ -153,24 +151,22 @@ class TokenManager:
         # service principal path
         if self._use_sp:
             try:
-                # azure.identity returns AccessToken with .token attribute
-                token = self.cred.get_token(*scopes)  # azure.identity accepts scope string(s)
+                token = self.cred.get_token(*scopes)
                 t = token.token if token else None
                 if scopes == SCOPE_FABRIC:
                     self.fabric_token = t
                 else:
                     self.storage_token = t
                 return t
-            except Exception as e:
+            except Exception:
                 log.exception("Service principal token acquisition failed")
                 return None
 
-        # msal/device-flow path
-        if not self.app:
+        # msal/device flow path (not used for automated deployments)
+        if not getattr(self, "app", None):
             log.error("No MSAL app configured")
             return None
 
-        # try silent
         for acc in self.app.get_accounts():
             res = self.app.acquire_token_silent(scopes, acc)
             if res and "access_token" in res:
@@ -182,7 +178,6 @@ class TokenManager:
                 self._save_cache()
                 return token
 
-        # device flow
         flow = self.app.initiate_device_flow(scopes=scopes)
         if not flow:
             log.error("Failed to start device flow")
@@ -203,7 +198,7 @@ class TokenManager:
         self._save_cache()
         return token
 
-# ---------- API helpers (get/post) ----------
+# ---------- API helpers ----------
 def api_get(url: str, token: str, params: dict = None) -> Optional[Dict]:
     try:
         r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params or {}, timeout=REQUEST_TIMEOUT)
@@ -229,7 +224,7 @@ def api_post(url: str, token: str, data: Dict) -> Tuple[Optional[Dict], Optional
         log.exception("api_post failed")
         return None, None
 
-# ---------- Onelake listing (used to detect tables) ----------
+# ---------- Onelake listing ----------
 def list_onelake_paths(ws_id: str, lh_id: str, path: str, token: str, recursive: bool = True) -> List[Dict]:
     paths: List[Dict] = []
     cont = None
@@ -268,67 +263,34 @@ def get_pipelines(ws_id: str, fabric_token: str) -> List[Dict]:
     data = api_get(f"{FABRIC_API_BASE}/workspaces/{ws_id}/items", fabric_token, params={"type": "DataPipeline"})
     return data.get("value", []) if data else []
 
-# def get_tables(ws_id: str, lh_id: str, fabric_token: str, storage_token: str) -> List[Dict]:
-#     tables: List[Dict] = []
-#     api_data = api_get(f"{FABRIC_API_BASE}/workspaces/{ws_id}/lakehouses/{lh_id}/tables", fabric_token)
-#     if api_data:
-#         for t in api_data.get("value", []):
-#             tables.append({"id": t.get("id", ""), "name": t.get("name", ""), "source": "api"})
-#     # also check onelake for delta folders to augment list
-#     if storage_token:
-#         paths = list_onelake_paths(ws_id, lh_id, "Tables", storage_token, True)
-#         for p in paths:
-#             if p.get("isDirectory") and "_delta_log" in p.get("name", ""):
-#                 name = p["name"].split("/_delta_log")[0].split("/")[-1]
-#                 if name and not any(tt["name"] == name for tt in tables):
-#                     tables.append({"id": "", "name": name, "source": "onelake"})
-#     return tables
-
 def get_tables(ws_id: str, lh_id: str, fabric_token: str, storage_token: str) -> List[Dict]:
     tables = []
-
-    # -------------------------------
-    # 1) Fabric API tables
-    # -------------------------------
     api_data = api_get(f"{FABRIC_API_BASE}/workspaces/{ws_id}/lakehouses/{lh_id}/tables", fabric_token)
-
     if api_data:
         for t in api_data.get("value", []):
             tables.append({
                 "id": t.get("id", ""),
                 "name": t.get("name", ""),
-                "folder": t.get("location", "").split("/")[-1],  # REAL folder
+                "folder": t.get("location", "").split("/")[-1],
                 "source": "api",
             })
-
-    # -------------------------------
-    # 2) Onelake scan for delta tables
-    # -------------------------------
     paths = list_onelake_paths(ws_id, lh_id, "Tables", storage_token, recursive=True)
-
     delta_folders = set()
     for p in paths:
         if p.get("isDirectory") and p["name"].endswith("_delta_log"):
             folder = p["name"].replace("/_delta_log", "").split("/")[-1]
             delta_folders.add(folder)
-
     for folder in sorted(delta_folders):
         if not any(t["folder"] == folder for t in tables):
             tables.append({
                 "id": "",
-                "name": folder,       # UI will show this
-                "folder": folder,     # REAL folder used to read delta log
+                "name": folder,
+                "folder": folder,
                 "source": "onelake",
             })
-
     return tables
 
-
 def get_table_columns(workspace_id: str, lakehouse_id: str, table_name: str, fabric_token: str) -> List[str]:
-    """
-    Fetch real column names for a given Lakehouse table.
-    Extracted from apps.py prediction helper.
-    """
     url = f"{FABRIC_API_BASE}/workspaces/{workspace_id}/lakehouses/{lakehouse_id}/tables/{table_name}"
     data = api_get(url, fabric_token)
     if data and "columns" in data:
@@ -343,11 +305,12 @@ def get_table_columns(workspace_id: str, lakehouse_id: str, table_name: str, fab
 def setup_kaggle():
     if not (KAGGLE_USERNAME and KAGGLE_KEY):
         raise RuntimeError("KAGGLE_USERNAME/KAGGLE_KEY are not set")
-    kaggle_dir = os.path.expanduser("~/.kaggle")
+    kaggle_dir = os.path.join(tempfile.gettempdir(), ".kaggle")
     os.makedirs(kaggle_dir, exist_ok=True)
     cfg_path = os.path.join(kaggle_dir, "kaggle.json")
     with open(cfg_path, "w") as f:
         json.dump({"username": KAGGLE_USERNAME, "key": KAGGLE_KEY}, f)
+    os.chmod(cfg_path, 0o600)
     os.environ["KAGGLE_CONFIG_DIR"] = kaggle_dir
 
 def download_dataset(slug: str) -> Tuple[str, str]:
@@ -360,7 +323,7 @@ def download_dataset(slug: str) -> Tuple[str, str]:
     api.dataset_download_files(slug, path=temp_dir, unzip=True)
     return temp_dir, slug
 
-# ---------- File reading & upload (same as your code) ----------
+# ---------- File reading & upload ----------
 SUPPORTED_TABLE_EXTS = {".csv", ".tsv", ".json", ".parquet", ".xls", ".xlsx"}
 
 def read_table_file(path: str) -> Dict[str, pd.DataFrame]:
@@ -407,19 +370,15 @@ def connect_fabric_filesystem():
         raise RuntimeError("azure-storage-file-datalake not available")
     if not ONELAKE_URL:
         raise RuntimeError("ONELAKE_URL is not configured")
-    # prefer service principal if available
     tm = TokenManager()
     storage_token = tm.get_token_for_storage()
     if storage_token and CLIENT_SECRET:
-        # if using service principal we can construct DataLakeServiceClient with credential instead of token
         try:
             credential = ClientSecretCredential(tenant_id=TENANT_ID, client_id=CLIENT_ID, client_secret=CLIENT_SECRET)
             client = DataLakeServiceClient(account_url=ONELAKE_URL, credential=credential)
             return client
         except Exception:
             log.exception("DataLakeServiceClient with ClientSecretCredential failed; falling back to token")
-    # fallback to token-based client (requires azure sdk support for token credentialless + SAS-like patterns)
-    # For simplicity, use ClientSecretCredential if present. Otherwise raise error.
     raise RuntimeError("Could not create DataLakeServiceClient: ensure azure.identity available and CLIENT_SECRET configured")
 
 def upload_to_fabric(temp_root: str, workspace_id: str, lakehouse_id: str) -> Dict[str, List[str]]:
@@ -446,7 +405,6 @@ def upload_to_fabric(temp_root: str, workspace_id: str, lakehouse_id: str) -> Di
                             table_local_dir.mkdir(parents=True, exist_ok=True)
                             try:
                                 if write_deltalake is None:
-                                    # fallback: write parquet if deltalake missing
                                     parquet_path = table_local_dir / f"{safe_table_name}.parquet"
                                     df.to_parquet(str(parquet_path), index=False)
                                 else:
@@ -518,80 +476,61 @@ def run_pipeline(workspace_id: str, pipeline_id: str, parameters: Dict[str, str]
         log.exception("run_pipeline failed")
         return {"status": "exception", "error": traceback.format_exc()}
 
-
 def poll_job_status(location: str):
     tm = TokenManager()
     token = tm.get_token_for_fabric()
     if not token:
         return {"status": "error", "error": "no token"}
-
     try:
         r = requests.get(location, headers={"Authorization": f"Bearer {token}"}, timeout=REQUEST_TIMEOUT)
-
         if r.status_code != 200:
             return {"status": "error", "code": r.status_code, "text": r.text}
-
         data = r.json()
-
         job_status = (
             data.get("status") or
             data.get("properties", {}).get("status") or
             data.get("properties", {}).get("state")
         )
-
         return {
             "status": job_status,
             "raw": data
         }
-
     except Exception as e:
         return {"status": "exception", "error": str(e)}
-    
 
 def check_table_exists(workspace_id: str, lakehouse_id: str, table_name: str) -> bool:
     tm = TokenManager()
     token = tm.get_token_for_fabric()
     if not token:
         return False
-
-    # Fabric SQL query endpoint
     url = f"{FABRIC_API_BASE}/workspaces/{workspace_id}/lakehouses/{lakehouse_id}/sql/query"
-
-    # SQL to check table
     sql = f"""
         SELECT name
         FROM sys.tables
         WHERE LOWER(name) = LOWER('{table_name.replace(" ", "_")}')
     """
-
     payload = {"query": sql}
-
     res, _ = api_post(url, token, payload)
     if not res:
         return False
-
     try:
         rows = res["results"][0]["rows"]
         return len(rows) > 0
-    except:
+    except Exception:
         return False
 
 def table_exists_via_api(workspace_id: str, lakehouse_id: str, table_name: str) -> bool:
     tm = TokenManager()
     fabric_token = tm.get_token_for_fabric()
     storage_token = tm.get_token_for_storage()
-
     if not (fabric_token and storage_token):
         return False
-
     tables = get_tables(workspace_id, lakehouse_id, fabric_token, storage_token)
-
     target = table_name.lower().replace(" ", "")
     for t in tables:
         name = t["name"].lower().replace(" ", "")
         if name == target:
             return True
-
     return False
 
 def resolve_table_path(workspace_id, lakehouse_id, table_name, source):
@@ -599,7 +538,6 @@ def resolve_table_path(workspace_id, lakehouse_id, table_name, source):
         return f"{ONELAKE_DFS}/{workspace_id}/{lakehouse_id}/Tables/{table_name}/_delta_log"
     else:
         return f"{ONELAKE_DFS}/{workspace_id}/{lakehouse_id}/{table_name}/_delta_log"
-
 
 # ---------- Notebook cell (string) ----------
 notebook_parameters_cell = r"""
@@ -612,7 +550,18 @@ destinationTable = "default_destination_name"
 
 # ---------- Flask app & endpoints ----------
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+
+# CORS: In production change "*" to your frontend origin(s) via BACKEND_CORS_ORIGINS env var
+BACKEND_CORS_ORIGINS = os.getenv("BACKEND_CORS_ORIGINS", "*")
+if BACKEND_CORS_ORIGINS.strip() == "*":
+    CORS(app, resources={r"/*": {"origins": "*"}})
+else:
+    origins = [o.strip() for o in BACKEND_CORS_ORIGINS.split(",") if o.strip()]
+    CORS(app, resources={r"/*": {"origins": origins}})
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
 @app.route("/workspaces", methods=["GET"])
 def api_workspaces():
@@ -623,7 +572,6 @@ def api_workspaces():
     ws = get_workspaces(token)
     return jsonify({"value": ws})
 
-# keep existing query-parameter endpoint (existing frontend code uses this)
 @app.route("/lakehouses", methods=["GET"])
 def api_lakehouses():
     workspace_id = request.args.get("workspace_id")
@@ -636,7 +584,6 @@ def api_lakehouses():
     l = get_lakehouses(workspace_id, token)
     return jsonify({"value": l})
 
-# NEW: compatibility route (some frontends call /workspaces/<id>/lakehouses)
 @app.route("/workspaces/<ws_id>/lakehouses", methods=["GET"])
 def api_lakehouses_ws_path(ws_id):
     if not ws_id:
@@ -662,21 +609,14 @@ def api_pipelines():
 
 @app.route("/prediction/pipelines", methods=["GET"])
 def api_prediction_pipelines():
-    """
-    Return pipelines that look like prediction/ML pipelines.
-    Heuristic copied from apps.py: filter by name containing pred/forecast/ml/model.
-    """
     workspace_id = request.args.get("workspace_id")
     if not workspace_id:
         return jsonify({"error": "workspace_id is required"}), 400
-
     tm = TokenManager()
     token = tm.get_token_for_fabric()
     if not token:
         return jsonify({"error": "could not acquire fabric token"}), 500
-
     pipelines = get_pipelines(workspace_id, token)
-    # Prefer prediction-style pipelines
     pred_pipes = [
         p for p in pipelines
         if any(
@@ -686,7 +626,6 @@ def api_prediction_pipelines():
     ]
     if not pred_pipes:
         pred_pipes = pipelines
-
     return jsonify({"value": pred_pipes})
 
 @app.route("/tables", methods=["GET"])
@@ -707,74 +646,48 @@ def api_tables():
 def api_prediction_columns():
     workspace_id = request.args.get("workspace_id")
     lakehouse_id = request.args.get("lakehouse_id")
-    table_name = request.args.get("table_name")   # Display name
-    folder = request.args.get("folder")           # NEW — REAL folder path
-    source = request.args.get("source")           # "api" | "onelake"
-
+    table_name = request.args.get("table_name")
+    folder = request.args.get("folder")
+    source = request.args.get("source")
     if not (workspace_id and lakehouse_id and table_name):
         return jsonify({"error": "workspace_id, lakehouse_id, table_name required"}), 400
-
     tm = TokenManager()
     fabric_token = tm.get_token_for_fabric()
     storage_token = tm.get_token_for_storage()
-
     if not (fabric_token and storage_token):
         return jsonify({"columns": [], "warning": "no tokens"}), 200
 
-    # ---------------------------------------------------------
-    # 1️⃣ Determine correct delta directory path
-    # ---------------------------------------------------------
-
-    # If frontend provides real folder, use it immediately
     if folder:
         real_path = f"Tables/{folder}"
-
     else:
-        # TABLE CAME FROM API
         if source == "api":
             meta_url = f"{FABRIC_API}/workspaces/{workspace_id}/lakehouses/{lakehouse_id}/tables/{table_name}"
             meta = api_get(meta_url, fabric_token)
-
             if meta and "location" in meta:
-                # Fabric API returns something like: "Tables/Blinkit_Orders"
                 real_path = meta["location"].strip("/")
             else:
                 real_path = f"Tables/{table_name}"
         else:
-            # OneLake discovered table
             real_path = f"Tables/{table_name}"
-
-    # ---------------------------------------------------------
-    # 2️⃣ Access delta log
-    # ---------------------------------------------------------
 
     base_url = f"{ONELAKE_DFS}/{workspace_id}/{lakehouse_id}/{real_path}/_delta_log"
     headers = {"Authorization": f"Bearer {storage_token}", "x-ms-version": DFS_VERSION}
-
     r = requests.get(base_url, headers=headers, params={"resource": "directory"}, timeout=30)
     if r.status_code != 200:
         return jsonify({"columns": [], "warning": f"cannot access delta log: {r.status_code}"}), 200
-
     files = [
         p["name"] for p in r.json().get("paths", [])
         if p["name"].endswith(".json")
     ]
-
     if not files:
         return jsonify({"columns": [], "warning": "no delta log json"}), 200
-
     latest = sorted(files)[-1]
     log_url = f"{base_url}/{latest}"
-
     r2 = requests.get(log_url, headers=headers, timeout=30)
     if r2.status_code != 200:
         return jsonify({"columns": [], "warning": "cannot read log"}), 200
-
     log_entries = [json.loads(line) for line in r2.text.splitlines()]
 
-    # ---------------------------------------------------------
-    # 3️⃣ Extract schemaString (Fabric Delta)
-    # ---------------------------------------------------------
     for e in log_entries:
         meta = e.get("metaData")
         if meta and "schemaString" in meta:
@@ -782,12 +695,9 @@ def api_prediction_columns():
                 schema = json.loads(meta["schemaString"])
                 cols = [f["name"] for f in schema.get("fields", [])]
                 return jsonify({"columns": cols})
-            except:
+            except Exception:
                 pass
 
-    # ---------------------------------------------------------
-    # 4️⃣ Extract schema (classic delta)
-    # ---------------------------------------------------------
     for e in log_entries:
         add = e.get("add")
         if add and "schema" in add:
@@ -795,14 +705,10 @@ def api_prediction_columns():
                 schema = json.loads(add["schema"])
                 cols = [f["name"] for f in schema.get("fields", [])]
                 return jsonify({"columns": cols})
-            except:
+            except Exception:
                 pass
 
-    # If nothing found
     return jsonify({"columns": [], "warning": "schema not found"}), 200
-
-
-
 
 @app.route("/search", methods=["GET"])
 def api_search():
@@ -824,7 +730,6 @@ def api_search():
 
 @app.route("/import", methods=["POST"])
 def api_import():
-    # robust JSON parsing: accept application/json and also fallback
     try:
         data = request.get_json(force=True, silent=True) or {}
     except Exception:
@@ -832,17 +737,13 @@ def api_import():
     slugs = data.get("slugs")
     workspace_id = data.get("workspace_id")
     lakehouse_id = data.get("lakehouse_id")
-    # Accept single "slug" also
     if not slugs and data.get("slug"):
         slugs = [data.get("slug")]
     if not slugs or not isinstance(slugs, list):
         return jsonify({"error":"slugs must be a list"}), 400
     if not workspace_id or not lakehouse_id:
         return jsonify({"error":"workspace_id & lakehouse_id are required"}), 400
-
-    # Log incoming payload for easier debugging (your frontend should show this payload in devtools as well)
     log.info("[IMPORT] payload received: slugs=%s workspace_id=%s lakehouse_id=%s", slugs, workspace_id, lakehouse_id)
-
     results = {}
     def process(slug):
         try:
@@ -855,58 +756,40 @@ def api_import():
         except Exception:
             log.exception("import failed for %s", slug)
             return slug, {"status":"failed", "error": traceback.format_exc()}
-
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = {ex.submit(process, s): s for s in slugs}
         for fut in as_completed(futures):
             slug_key, res = fut.result()
             results[slug_key] = res
-
     return jsonify({"status":"completed", "results": results})
-
-
 
 @app.route("/run-pipeline", methods=["POST"])
 def api_run_pipeline():
-    """
-    Cleaning (or generic) pipeline launcher.
-    For prediction pipelines, prefer /prediction/launch which allows full parameter dict.
-    """
     try:
         data = request.get_json(force=True, silent=True) or {}
     except Exception:
         data = {}
-
     workspace_id = data.get("workspace_id")
     pipeline_id = data.get("pipeline_id")
-    lakehouse_id = data.get("lakehouse_id")  # IMPORTANT
+    lakehouse_id = data.get("lakehouse_id")
     source_table = data.get("sourceTable") or data.get("source")
     destination_table = data.get("destinationTable") or data.get("destination")
-
     if not (workspace_id and pipeline_id and lakehouse_id and source_table and destination_table):
         return jsonify({"error": "workspace_id, pipeline_id, lakehouse_id, sourceTable, destinationTable required"}), 400
-
     params = {"sourceTable": source_table, "destinationTable": destination_table}
     start_res = run_pipeline(workspace_id, pipeline_id, params)
-
-    # Attach lakehouse id + destination table for follow-up polling
     start_res["lakehouse_id"] = lakehouse_id
     start_res["destination_table"] = destination_table
-
     return jsonify(start_res)
-
-
 
 @app.route("/debug-tables", methods=["GET"])
 def debug_tables():
     workspace_id = request.args.get("workspace_id")
     lakehouse_id = request.args.get("lakehouse_id")
-
     tm = TokenManager()
     token = tm.get_token_for_storage()
     if not token:
-        return {"error": "no storage token"}, 500
-
+        return jsonify({"error": "no storage token"}), 500
     paths = list_onelake_paths(workspace_id, lakehouse_id, "Tables", token, recursive=False)
     return jsonify(paths)
 
@@ -916,96 +799,48 @@ def api_poll_job():
     workspace_id = request.args.get("workspace_id")
     lakehouse_id = request.args.get("lakehouse_id")
     destination_table = request.args.get("destination_table")
-
     if not all([location, workspace_id, lakehouse_id, destination_table]):
         return jsonify({"error": "location, workspace_id, lakehouse_id, destination_table are required"}), 400
-
     status_res = poll_job_status(location)
     job_status = status_res.get("status")
-
-    # treat completed as success
     if job_status and job_status.lower() in ("succeeded", "completed"):
-        
-        # **IMPORTANT**: DO NOT normalize name here 
         exists = table_exists_via_api(workspace_id, lakehouse_id, destination_table)
-
         if exists:
             return jsonify({
                 "status": "success",
                 "pipeline_status": job_status,
                 "table_saved": True
             })
-
         return jsonify({
             "status": "waiting",
             "pipeline_status": job_status,
             "table_saved": False
         })
-
     return jsonify(status_res)
 
 @app.route("/prediction/poll", methods=["GET"])
 def api_prediction_poll():
-    """
-    Lightweight polling endpoint for prediction pipelines.
-    It just forwards to poll_job_status and returns raw job status,
-    without checking for any table existence.
-    """
     location = request.args.get("location")
     if not location:
         return jsonify({"error": "location is required"}), 400
-
     status_res = poll_job_status(location)
     return jsonify(status_res)
 
 @app.route("/prediction/launch", methods=["POST"])
 def api_prediction_launch():
-    """
-    Launch a prediction pipeline programmatically.
-    Body JSON:
-    {
-        "workspace_id": "...",
-        "pipeline_id": "...",
-        "lakehouse_id": "...",   # optional but recommended
-        "parameters": {
-            "sourceTable": "...",
-            "destinationTable": "...",
-            "dateColumn": "...",
-            "targetColumn": "...",
-            "startDate": "...",
-            "endDate": "...",
-            "forecastHorizon": "...",
-            "filterColumn": "...",
-            "productFilters": "...",
-            "selectedColumns": "col1,col2,...",
-            "modelType": "classification|regression|timeseries",
-            ...
-        }
-    }
-    This mirrors the functionality of run_prediction_pipeline() in apps.py
-    but in a non-interactive HTTP form usable by your React UI.
-    """
-
     try:
         data = request.get_json(force=True, silent=True) or {}
     except Exception:
         return jsonify({"error": "invalid JSON"}), 400
-
     workspace_id = data.get("workspace_id")
     pipeline_id = data.get("pipeline_id")
     lakehouse_id = data.get("lakehouse_id")
-    parameters  = data.get("parameters") or {}
-
+    parameters = data.get("parameters") or {}
     if not (workspace_id and pipeline_id and parameters):
         return jsonify({"error": "workspace_id, pipeline_id and parameters required"}), 400
-
-    # Reuse your existing run_pipeline() logic
     result = run_pipeline(workspace_id, pipeline_id, parameters)
-
-    # Attach lakehouse_id + destinationTable (if provided) for polling
     if lakehouse_id:
         result["lakehouse_id"] = lakehouse_id
-
     dest = (
         parameters.get("destinationTable")
         or parameters.get("destination_table")
@@ -1013,9 +848,7 @@ def api_prediction_launch():
     )
     if dest:
         result["destination_table"] = dest
-
     return jsonify(result)
-
 
 @app.route("/notebook-cell", methods=["GET"])
 def api_notebook_cell():
@@ -1025,4 +858,5 @@ def api_notebook_cell():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     log.info("Starting combined API on port %s", port)
-    app.run(host="0.0.0.0", port=port, debug=True)
+    debug_mode = os.getenv("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)

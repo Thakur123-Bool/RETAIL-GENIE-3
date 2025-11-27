@@ -1,9 +1,27 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-msal==1.27.0
+# backend/app/requirements.txt
+# Core web
+Flask==2.3.3
+flask-cors==3.0.10
+gunicorn==21.2.0
+python-dotenv==1.0.0
 requests==2.31.0
+
+# Azure / authentication
+msal==1.23.0
+azure-identity==1.15.0
+azure-storage-file-datalake==12.7.0
+azure-core==1.30.0
+
+# Data science / IO - keep only what you need if you want to slim image
 pandas==2.1.4
 pyarrow==14.0.1
 scikit-learn==1.3.2
+
+# Delta lake (optional but used by upload_to_fabric if present)
+deltalake==0.8.0
+
+# Kaggle support for dataset import
+kaggle==1.5.13
+
+# small utils
 tabulate==0.9.0
-python-dotenv==1.0.0  # For loading .env
