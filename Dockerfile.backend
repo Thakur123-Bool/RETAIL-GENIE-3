@@ -50,4 +50,4 @@ ENV PYTHONUNBUFFERED=1
 
 # Run gunicorn and point to app.main:app (module app/main.py -> app.main)
 # --chdir ensures Gunicorn's working dir is /app
-CMD ["gunicorn", "app.main:app", "-b", "0.0.0.0:8000", "--workers", "2", "--chdir", "/app"]
+CMD ["gunicorn", "app.main:app", "-b", "0.0.0.0:5000", "--workers", "2", "--chdir", "/app"]
