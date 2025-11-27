@@ -1,0 +1,93 @@
+{
+  "name": "PredictionJob",
+  "type": "object",
+  "properties": {
+    "job_name": {
+      "type": "string",
+      "description": "Name of the prediction job"
+    },
+    "workspace_name": {
+      "type": "string",
+      "description": "Fabric workspace name"
+    },
+    "lakehouse_name": {
+      "type": "string",
+      "description": "Lakehouse or data source"
+    },
+    "table_name": {
+      "type": "string",
+      "description": "SQL analytics table name"
+    },
+    "pipeline_name": {
+      "type": "string",
+      "description": "Pipeline/dataflow name"
+    },
+    "start_date": {
+      "type": "string",
+      "format": "date",
+      "description": "Start date for data range"
+    },
+    "end_date": {
+      "type": "string",
+      "format": "date",
+      "description": "End date for data range"
+    },
+    "products": {
+      "type": "string",
+      "description": "Product filters (comma-separated)"
+    },
+    "forecast_horizon": {
+      "type": "integer",
+      "description": "Forecast horizon in days"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed",
+        "failed"
+      ],
+      "default": "pending",
+      "description": "Current job status"
+    },
+    "progress_percentage": {
+      "type": "number",
+      "description": "Execution progress (0-100)"
+    },
+    "execution_started": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When execution started"
+    },
+    "execution_completed": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When execution completed"
+    },
+    "error_message": {
+      "type": "string",
+      "description": "Error details if failed"
+    },
+    "report_url": {
+      "type": "string",
+      "description": "Power BI report URL"
+    },
+    "notebook_id": {
+      "type": "string",
+      "description": "Fabric notebook identifier"
+    },
+    "pipeline_run_id": {
+      "type": "string",
+      "description": "Pipeline execution run ID"
+    }
+  },
+  "required": [
+    "job_name",
+    "workspace_name",
+    "lakehouse_name",
+    "table_name",
+    "start_date",
+    "end_date"
+  ]
+}

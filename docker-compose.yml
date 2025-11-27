@@ -1,0 +1,23 @@
+version: '3.8'
+services:
+  backend:
+    build: .
+    context: .  # Root
+    dockerfile: Dockerfile.backend
+    ports:
+      - "5000:5000"
+    env_file:
+      - backend/.env
+    volumes:
+      - ./backend/app:/app  # For hot reload in dev
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "3000:80"  # Vite dev on 5173, but prod on 80
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://backend:5000  # Internal Docker networking
