@@ -48,8 +48,8 @@ export default function App() {
     <ToastProvider>
       <Layout>
         <Routes>
-          <Route path="/" element={<ApiConsole />} />     {/* ⭐ API Console is home */}
-          <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="#" element={<ApiConsole />} />     {/* ⭐ API Console is home */}
+          <Route path="/" element={<Dashboard />} />
           <Route path="/newprediction" element={<NewPrediction />} />
           <Route path="/jobmonitor" element={<JobMonitor />} />
           <Route path="/reports" element={<Reports />} />
