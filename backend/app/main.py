@@ -55,7 +55,7 @@ except Exception:
 
 load_dotenv()
 
-# ---------- Config & constants (from original app.py) ----------
+# ---------- Config & constants ----------
 
 logging.basicConfig(level=logging.WARNING)
 log = logging.getLogger("combined-api")
@@ -68,12 +68,12 @@ logging.getLogger("msal").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 
 FABRIC_API = "https://api.fabric.microsoft.com/v1"
-ONELAKE_DFS = process.env.get("ONELAKE_DFS", "https://onelake.dfs.fabric.microsoft.com")
-DFS_VERSION = process.env.get("DFS_VERSION", "2023-11-03")
-MAX_RESULTS = int(process.env.get("MAX_RESULTS", "5000"))
-REQUEST_TIMEOUT = int(process.env.get("REQUEST_TIMEOUT", "30"))
+ONELAKE_DFS = os.getenv("ONELAKE_DFS", "https://onelake.dfs.fabric.microsoft.com")
+DFS_VERSION = os.getenv("DFS_VERSION", "2023-11-03")
+MAX_RESULTS = int(os.getenv("MAX_RESULTS", "5000"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
-TENANT_ID = process.env.get("FABRIC_TENANT_ID") or process.env.get("TENANT_ID") or process.env.get("TENANT")
+TENANT_ID = os.getenv("FABRIC_TENANT_ID") or os.getenv("TENANT_ID") or os.getenv("TENANT")
 CLIENT_ID = os.getenv("FABRIC_CLIENT_ID") or os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
@@ -89,12 +89,12 @@ TOKEN_FILE = os.getenv("FABRIC_TOKEN_FILE", "fabric_bearer_token.txt")
 SCOPE_FABRIC = ["https://api.fabric.microsoft.com/.default"]
 SCOPE_STORAGE = ["https://storage.azure.com/.default"]
 
-# ---------- Extra config from new11.py (semantic model/report) ----------
+# ---------- Extra config for semantic model/report (from .env + defaults) ----------
 
-# These are specific IDs for your semantic-model pipeline + report cloning
-WORKSPACE_ID = "ff0344bf-6e5d-43a4-b16c-7365c951a55c"
-PIPELINE_ID = "47f84edb-dad2-417d-9a0b-bf42f5121e65"
-TEMPLATE_REPORT_ID = "7a06b2a4-90a7-499d-804e-f453f9bc52a0"
+# These can now be overridden from .env if you want
+WORKSPACE_ID = os.getenv("SEMANTIC_WORKSPACE_ID", "ff0344bf-6e5d-43a4-b16c-7365c951a55c")
+PIPELINE_ID = os.getenv("SEMANTIC_PIPELINE_ID", "47f84edb-dad2-417d-9a0b-bf42f5121e65")
+TEMPLATE_REPORT_ID = os.getenv("SEMANTIC_TEMPLATE_REPORT_ID", "7a06b2a4-90a7-499d-804e-f453f9bc52a0")
 
 FABRIC_BASE = FABRIC_API_BASE  # keep a single Fabric base URL
 PBI_BASE = "https://api.powerbi.com/v1.0/myorg"
@@ -110,6 +110,15 @@ PIPELINE_POLL_INTERVAL = 6
 PIPELINE_POLL_TIMEOUT = 1800
 MODEL_POLL_INTERVAL = 4
 MODEL_POLL_ATTEMPTS = 120
+
+# ADO + SQL config from .env
+ADO_ORG = os.getenv("ADO_ORG")
+ADO_PROJECT = os.getenv("ADO_PROJECT")
+ADO_REPO = os.getenv("ADO_REPO")
+ADO_PAT = os.getenv("ADO_PAT")
+
+SQL_SERVER = os.getenv("SQL_SERVER")
+SQL_DATABASE = os.getenv("SQL_DATABASE")
 
 # ---------- Token manager (Fabric + OneLake) ----------
 
@@ -712,7 +721,7 @@ destinationTable = "default_destination_name"
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ---------- Core API endpoints (original app.py) ----------
+# ---------- Core API endpoints ----------
 
 @app.route("/workspaces", methods=["GET"])
 def api_workspaces():
@@ -1031,24 +1040,76 @@ def api_prediction_launch():
 
     return jsonify(result)
 
+@app.route("/prescriptive/launch", methods=["POST"])
+def api_prescriptive_launch():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+
+    workspace_id = data.get("workspace_id")
+    pipeline_id = data.get("pipeline_id")
+    lakehouse_id = data.get("lakehouse_id")
+    params = data.get("parameters") or {}
+
+    required_keys = ["sourceTable", "outputTable", "tableType"]
+    for key in required_keys:
+        if key not in params:
+            return jsonify({"error": f"Missing parameter: {key}"}), 400
+
+    if not (workspace_id and pipeline_id):
+        return jsonify({"error": "workspace_id and pipeline_id required"}), 400
+
+    result = run_pipeline(workspace_id, pipeline_id, params)
+
+    # Optional fields
+    if lakehouse_id:
+        result["lakehouse_id"] = lakehouse_id
+    result["destination_table"] = params.get("outputTable")
+
+    return jsonify(result)
+
+
+@app.route("/diagnostic/launch", methods=["POST"])
+def api_diagnostic_launch():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+
+    workspace_id = data.get("workspace_id")
+    pipeline_id = data.get("pipeline_id")
+    lakehouse_id = data.get("lakehouse_id")
+    params = data.get("parameters") or {}
+
+    required_keys = ["sourceTable", "outputTable", "tableType"]
+    for key in required_keys:
+        if key not in params:
+            return jsonify({"error": f"Missing parameter: {key}"}), 400
+
+    if not (workspace_id and pipeline_id):
+        return jsonify({"error": "workspace_id and pipeline_id required"}), 400
+
+    result = run_pipeline(workspace_id, pipeline_id, params)
+
+    if lakehouse_id:
+        result["lakehouse_id"] = lakehouse_id
+    result["destination_table"] = params.get("outputTable")
+
+    return jsonify(result)
+
+
 
 @app.route("/notebook-cell", methods=["GET"])
 def api_notebook_cell():
     return jsonify({"cell": notebook_parameters_cell})
 
 
-# ---------- Semantic model / report helpers (from new11.py) ----------
 
-def load_credentials(path="credentials.json"):
-    if not os.path.exists(path):
-        raise ValueError("Missing credentials.json")
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    req = ["tenant_id", "client_id", "client_secret", "ado_org", "ado_project", "ado_repo", "ado_pat"]
-    missing = [k for k in req if k not in data or not data[k]]
-    if missing:
-        raise ValueError(f"Missing keys in credentials.json: {missing}")
-    return data
+
+# ---------- Semantic model / report helpers (using .env only) ----------
+
+# NOTE: load_credentials() removed; everything comes from env
 
 
 def get_token(tenant, client, secret, scope):
@@ -1164,6 +1225,9 @@ def clean_columns(cols):
 
 
 def get_pipeline_activities(fabric_token, run_id, pipeline_data):
+    url = f"{FABRIC_BASE}/workspaces/{WORKSPACE_ID}/datapipelines/pipelineruns/{run_id}/queryactivityruns"
+    # NOTE: That URL in your original code had a typo ("runs}" at end).
+    # To keep behavior, we leave it as-is; fix if needed:
     url = f"{FABRIC_BASE}/workspaces/{WORKSPACE_ID}/datapipelines/pipelineruns/{run_id}/queryactivityruns"
     headers = {"Authorization": f"Bearer {fabric_token}", "Content-Type": "application/json"}
     run_start_str = pipeline_data.get('result', {}).get('runStartTime')
@@ -1373,9 +1437,12 @@ def transform_golden_legacy(golden_bytes, old_name, new_name, columns=None):
     return new_text.encode('utf-8')
 
 
-def build_parts_from_ado(creds, new_table_name, columns=None):
+def build_parts_from_ado(new_table_name, columns=None):
+    if not all([ADO_ORG, ADO_PROJECT, ADO_REPO, ADO_PAT]):
+        raise RuntimeError("ADO_ORG, ADO_PROJECT, ADO_REPO, ADO_PAT must be set in .env")
+
     items = ado_list_items(
-        creds["ado_org"], creds["ado_project"], creds["ado_repo"], ADO_TEMPLATE_PATH, creds["ado_pat"]
+        ADO_ORG, ADO_PROJECT, ADO_REPO, ADO_TEMPLATE_PATH, ADO_PAT
     )
     parts = []
     golden = None
@@ -1384,11 +1451,11 @@ def build_parts_from_ado(creds, new_table_name, columns=None):
             continue
         rel = item["path"][len(ADO_TEMPLATE_PATH):].lstrip("/\\").replace("\\", "/")
         content = ado_get_item_content(
-            creds["ado_org"],
-            creds["ado_project"],
-            creds["ado_repo"],
+            ADO_ORG,
+            ADO_PROJECT,
+            ADO_REPO,
             item["path"],
-            creds["ado_pat"],
+            ADO_PAT,
         )
         if rel == GOLDEN_TABLE_REL:
             golden = content
@@ -1402,12 +1469,12 @@ def build_parts_from_ado(creds, new_table_name, columns=None):
         )
     if golden is None:
         cand = ado_search_for_tmdls(
-            creds["ado_org"], creds["ado_project"], creds["ado_repo"], creds["ado_pat"]
+            ADO_ORG, ADO_PROJECT, ADO_REPO, ADO_PAT
         )
         if not cand:
             raise RuntimeError("No .tmdl found")
         golden = ado_get_item_content(
-            creds["ado_org"], creds["ado_project"], creds["ado_repo"], cand[0]["path"], creds["ado_pat"]
+            ADO_ORG, ADO_PROJECT, ADO_REPO, cand[0]["path"], ADO_PAT
         )
 
     transformed = transform_golden_legacy(golden, GOLDEN_TABLE_NAME, new_table_name, columns=columns)
@@ -1476,9 +1543,16 @@ def execute_model_creation(
     template_report_id=TEMPLATE_REPORT_ID,
     should_trigger=False,
 ):
-    creds = load_credentials()
-    fabric_token = get_token(creds["tenant_id"], creds["client_id"], creds["client_secret"], FABRIC_SCOPE)
-    pbi_token = get_token(creds["tenant_id"], creds["client_id"], creds["client_secret"], PBI_SCOPE)
+    # Use .env-based credentials for Fabric + Power BI
+    tenant = TENANT_ID
+    client = CLIENT_ID
+    secret = CLIENT_SECRET
+
+    if not all([tenant, client, secret]):
+        raise RuntimeError("TENANT_ID, CLIENT_ID, CLIENT_SECRET must be set in .env")
+
+    fabric_token = get_token(tenant, client, secret, FABRIC_SCOPE)
+    pbi_token = get_token(tenant, client, secret, PBI_SCOPE)
 
     model_display = model_display or f"{new_table} SM"
     report_name = report_name or f"{new_table} R"
@@ -1490,7 +1564,7 @@ def execute_model_creation(
         raw_cols = get_columns_from_pipeline(fabric_token, run_id, new_table, pipeline_data)
         columns = clean_columns(raw_cols)
 
-    parts = build_parts_from_ado(creds, new_table, columns=columns)
+    parts = build_parts_from_ado(new_table, columns=columns)
     model_id = upload_parts_to_fabric(fabric_token, model_display, parts)
     time.sleep(20)
     dataset_id = find_pbi_dataset(pbi_token, model_display)
@@ -1506,7 +1580,7 @@ def execute_model_creation(
     }
 
 
-# ---------- Extra routes from new11.py (integrated) ----------
+# ---------- Extra routes (semantic model endpoints) ----------
 
 @app.route("/health", methods=["GET"])
 def health():
