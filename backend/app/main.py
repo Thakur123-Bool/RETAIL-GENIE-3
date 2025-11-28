@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import sys
 import json
@@ -7,6 +8,9 @@ import logging
 import time
 import traceback
 import re
+import uuid
+import base64
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +19,7 @@ import requests
 import pandas as pd
 import pyarrow as pa
 
+from requests.auth import HTTPBasicAuth
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -50,56 +55,66 @@ except Exception:
 
 load_dotenv()
 
-# ---------- Config & constants ----------
-# reduce noisy azure/request logging by default; keep warnings+errors visible
+# ---------- Config & constants (from original app.py) ----------
+
 logging.basicConfig(level=logging.WARNING)
 log = logging.getLogger("combined-api")
-# keep module-level logger objects for your own info-level messages
 log.setLevel(logging.INFO)
 
-# also lower some very noisy libraries to WARNING
 logging.getLogger("azure").setLevel(logging.WARNING)
 logging.getLogger("azure.identity").setLevel(logging.WARNING)
 logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
 logging.getLogger("msal").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 
-# Use values from your original code if present
 FABRIC_API = "https://api.fabric.microsoft.com/v1"
-ONELAKE_DFS = os.getenv("ONELAKE_DFS", "https://onelake.dfs.fabric.microsoft.com")
-DFS_VERSION = os.getenv("DFS_VERSION", "2023-11-03")
-MAX_RESULTS = int(os.getenv("MAX_RESULTS", "5000"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+ONELAKE_DFS = process.env.get("ONELAKE_DFS", "https://onelake.dfs.fabric.microsoft.com")
+DFS_VERSION = process.env.get("DFS_VERSION", "2023-11-03")
+MAX_RESULTS = int(process.env.get("MAX_RESULTS", "5000"))
+REQUEST_TIMEOUT = int(process.env.get("REQUEST_TIMEOUT", "30"))
 
-# MSAL names (kept for backwards compatibility)
-TENANT_ID = os.getenv("FABRIC_TENANT_ID") or os.getenv("TENANT_ID") or os.getenv("TENANT")
+TENANT_ID = process.env.get("FABRIC_TENANT_ID") or process.env.get("TENANT_ID") or process.env.get("TENANT")
 CLIENT_ID = os.getenv("FABRIC_CLIENT_ID") or os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")  # optional - if present, use service-principal flow
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
-# Kaggle config
 KAGGLE_USERNAME = os.getenv("KAGGLE_USERNAME")
 KAGGLE_KEY = os.getenv("KAGGLE_KEY")
 
-ONELAKE_URL = os.getenv("ONELAKE_URL")  # required for DataLakeServiceClient
+ONELAKE_URL = os.getenv("ONELAKE_URL")
 FABRIC_API_BASE = FABRIC_API
 
-# Token cache filenames
 CACHE_FILE = os.getenv("MSAL_CACHE_FILE", "msal_token_cache.bin")
 TOKEN_FILE = os.getenv("FABRIC_TOKEN_FILE", "fabric_bearer_token.txt")
 
-# ---------- Token manager (supports device-flow MSAL and optionally service principal) ----------
 SCOPE_FABRIC = ["https://api.fabric.microsoft.com/.default"]
 SCOPE_STORAGE = ["https://storage.azure.com/.default"]
 
+# ---------- Extra config from new11.py (semantic model/report) ----------
+
+# These are specific IDs for your semantic-model pipeline + report cloning
+WORKSPACE_ID = "ff0344bf-6e5d-43a4-b16c-7365c951a55c"
+PIPELINE_ID = "47f84edb-dad2-417d-9a0b-bf42f5121e65"
+TEMPLATE_REPORT_ID = "7a06b2a4-90a7-499d-804e-f453f9bc52a0"
+
+FABRIC_BASE = FABRIC_API_BASE  # keep a single Fabric base URL
+PBI_BASE = "https://api.powerbi.com/v1.0/myorg"
+
+FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default"
+PBI_SCOPE = "https://analysis.windows.net/powerbi/api/.default"
+
+ADO_TEMPLATE_PATH = "/Template Semantic Model.SemanticModel"
+GOLDEN_TABLE_REL = "definition/tables/Blinkit_Orders.tmdl"
+GOLDEN_TABLE_NAME = "Blinkit_Orders"
+
+PIPELINE_POLL_INTERVAL = 6
+PIPELINE_POLL_TIMEOUT = 1800
+MODEL_POLL_INTERVAL = 4
+MODEL_POLL_ATTEMPTS = 120
+
+# ---------- Token manager (Fabric + OneLake) ----------
+
 
 class TokenManager:
-    """
-    If CLIENT_SECRET present -> uses ClientSecretCredential (service principal).
-    Otherwise falls back to MSAL device-flow (interactive).
-
-    NOTE: in non-interactive environments (no TTY), device-flow will not be attempted
-    to avoid blocking startup — get_token will return None instead.
-    """
     _instance = None
 
     def __new__(cls):
@@ -119,18 +134,14 @@ class TokenManager:
             CLIENT_SECRET and CLIENT_ID and TENANT_ID and ClientSecretCredential is not None
         )
         if not self._use_sp and msal is None:
-            log.warning(
-                "MSAL not available and SERVICE PRINCIPAL not configured - auth may fail."
-            )
+            log.warning("MSAL not available and SERVICE PRINCIPAL not configured - auth may fail.")
 
         if self._use_sp:
-            # service principal credential
             self.cred = ClientSecretCredential(
                 tenant_id=TENANT_ID, client_id=CLIENT_ID, client_secret=CLIENT_SECRET
             )
             log.info("TokenManager: using ClientSecretCredential (service principal).")
         else:
-            # msal public client (device flow)
             if msal:
                 self.cache = msal.SerializableTokenCache()
                 if os.path.exists(CACHE_FILE):
@@ -140,11 +151,7 @@ class TokenManager:
                         log.info("MSAL token cache loaded")
                     except Exception:
                         log.info("Failed to load MSAL cache")
-                authority = (
-                    f"https://login.microsoftonline.com/{TENANT_ID}"
-                    if TENANT_ID
-                    else None
-                )
+                authority = f"https://login.microsoftonline.com/{TENANT_ID}" if TENANT_ID else None
                 self.app = msal.PublicClientApplication(
                     CLIENT_ID, authority=authority, token_cache=self.cache
                 )
@@ -167,11 +174,9 @@ class TokenManager:
         return self.get_token(SCOPE_STORAGE)
 
     def get_token(self, scopes: List[str]) -> Optional[str]:
-        # service principal path
         if self._use_sp:
             try:
-                # azure.identity returns AccessToken with .token attribute
-                token = self.cred.get_token(*scopes)  # azure.identity accepts scope string(s)
+                token = self.cred.get_token(*scopes)
                 t = token.token if token else None
                 if scopes == SCOPE_FABRIC:
                     self.fabric_token = t
@@ -182,12 +187,10 @@ class TokenManager:
                 log.exception("Service principal token acquisition failed")
                 return None
 
-        # msal/device-flow path
         if not self.app:
             log.error("No MSAL app configured")
             return None
 
-        # try silent
         for acc in self.app.get_accounts():
             res = self.app.acquire_token_silent(scopes, acc)
             if res and "access_token" in res:
@@ -199,25 +202,13 @@ class TokenManager:
                 self._save_cache()
                 return token
 
-        # SAFETY: If running non-interactive (no TTY / container), do NOT start device flow
-        # to avoid blocking the process during deployment. Instead return None.
-        noninteractive_flag = os.environ.get("NONINTERACTIVE", "").lower() in ("1", "true", "yes")
-        if noninteractive_flag or not sys.stdin or not sys.stdin.isatty():
-            log.error("Non-interactive environment detected — skipping device-flow auth.")
-            return None
-
-        # device flow (interactive)
-        try:
-            flow = self.app.initiate_device_flow(scopes=scopes)
-        except Exception:
-            flow = None
-
+        flow = self.app.initiate_device_flow(scopes=scopes)
         if not flow:
             log.error("Failed to start device flow")
             return None
         print("\n=== DEVICE CODE AUTH ===")
-        print(f"Visit: {flow.get('verification_uri') or flow.get('verification_uri_complete')}")
-        print(f"Code : {flow.get('user_code')}")
+        print(f"Visit: {flow['verification_uri']}")
+        print(f"Code : {flow['user_code']}")
         input("After signing in, press Enter to continue...")
         res = self.app.acquire_token_by_device_flow(flow)
         if "access_token" not in res:
@@ -232,7 +223,8 @@ class TokenManager:
         return token
 
 
-# ---------- API helpers (get/post) ----------
+# ---------- Generic Fabric helpers ----------
+
 def api_get(url: str, token: str, params: dict = None) -> Optional[Dict]:
     try:
         r = requests.get(
@@ -270,7 +262,8 @@ def api_post(url: str, token: str, data: Dict) -> Tuple[Optional[Dict], Optional
         return None, None
 
 
-# ---------- Onelake listing (used to detect tables) ----------
+# ---------- Onelake listing ----------
+
 def list_onelake_paths(
     ws_id: str, lh_id: str, path: str, token: str, recursive: bool = True
 ) -> List[Dict]:
@@ -283,8 +276,6 @@ def list_onelake_paths(
             "maxResults": str(MAX_RESULTS),
         }
         if path and path not in ["", "/"]:
-            # 💡 Only pass the FIRST directory
-            # Because OneLake DFS API does NOT accept nested dirs
             first = path.strip("/").split("/")[0]
             params["directory"] = first
 
@@ -313,6 +304,7 @@ def list_onelake_paths(
 
 
 # ---------- Discovery helpers ----------
+
 def get_workspaces(fabric_token: str) -> List[Dict]:
     data = api_get(f"{FABRIC_API_BASE}/workspaces", fabric_token)
     return data.get("value", []) if data else []
@@ -340,7 +332,6 @@ def get_tables(ws_id: str, lh_id: str, fabric_token: str, storage_token: str) ->
     if api_data:
         for t in api_data.get("value", []):
             tables.append({"id": t.get("id", ""), "name": t.get("name", ""), "source": "api"})
-    # also check onelake for delta folders to augment list
     if storage_token:
         paths = list_onelake_paths(ws_id, lh_id, "Tables", storage_token, True)
         for p in paths:
@@ -351,20 +342,11 @@ def get_tables(ws_id: str, lh_id: str, fabric_token: str, storage_token: str) ->
     return tables
 
 
-# ---------- Prediction helpers (extracted from apps.py) ----------
+# ---------- Prediction helpers ----------
+
 def get_table_columns(
     workspace_id: str, lakehouse_id: str, table_name: str, fabric_token: str
 ) -> List[str]:
-    """
-    Fetch real columns for a given table in a lakehouse, using Fabric API.
-
-    This is the API-ified version of get_table_columns() from apps.py:
-    it allows your frontend to show column pickers for:
-      - dateColumn
-      - targetColumn
-      - filterColumn
-      - selectedColumns
-    """
     url = (
         f"{FABRIC_API_BASE}/workspaces/{workspace_id}/lakehouses/"
         f"{lakehouse_id}/tables/{table_name}"
@@ -381,14 +363,6 @@ def get_table_columns(
 
 
 def get_delta_columns_from_onelake(workspace_id, lakehouse_id, table_name, storage_token):
-    """
-    Correct Delta schema extractor for Microsoft Fabric OneLake.
-    NOTE:
-    OneLake DFS API does NOT allow nested directory listing.
-    So we must list ONLY the top-level "Tables" folder and filter paths manually.
-    """
-
-    # 1️⃣ Load ALL paths under "Tables"
     all_paths = list_onelake_paths(
         workspace_id,
         lakehouse_id,
@@ -397,8 +371,6 @@ def get_delta_columns_from_onelake(workspace_id, lakehouse_id, table_name, stora
         recursive=True
     )
 
-    # 2️⃣ Filter only JSON delta-log commit files for this table
-    #    Example: "Tables/blinkit_inventory_diagnosis/_delta_log/00000000000000000000.json"
     json_logs = [
         p for p in all_paths
         if p["name"].startswith(f"Tables/{table_name}/_delta_log/")
@@ -409,13 +381,11 @@ def get_delta_columns_from_onelake(workspace_id, lakehouse_id, table_name, stora
         print(f"[DEBUG] No delta log JSON files found for table: {table_name}")
         return []
 
-    # 3️⃣ Sort by filename to get the FIRST commit (schema definition lives here)
     json_logs.sort(key=lambda x: x["name"])
     first_json = json_logs[0]["name"]
 
     print("[DEBUG] Using delta schema:", first_json)
 
-    # 4️⃣ Download the delta log JSON file
     url = f"{ONELAKE_DFS}/{workspace_id}/{lakehouse_id}/{first_json}"
     headers = {
         "Authorization": f"Bearer {storage_token}",
@@ -427,7 +397,6 @@ def get_delta_columns_from_onelake(workspace_id, lakehouse_id, table_name, stora
         print("[DEBUG] Could not download delta_log:", response.text)
         return []
 
-    # 5️⃣ Parse line-by-line and find the "metaData" entry
     for line in response.text.splitlines():
         try:
             entry = json.loads(line)
@@ -444,14 +413,6 @@ def get_delta_columns_from_onelake(workspace_id, lakehouse_id, table_name, stora
 def get_prediction_pipelines_for_workspace(
     workspace_id: str, fabric_token: str
 ) -> List[Dict]:
-    """
-    Extracted from run_prediction_pipeline() (apps.py).
-
-    - Loads all DataPipeline items for the workspace
-    - Filters to those whose name suggests prediction/ML:
-        'pred', 'forecast', 'ml', 'model' (case-insensitive)
-    - If no such pipelines exist, returns all pipelines (fallback).
-    """
     pipelines = get_pipelines(workspace_id, fabric_token)
     if not pipelines:
         return []
@@ -466,6 +427,7 @@ def get_prediction_pipelines_for_workspace(
 
 
 # ---------- Kaggle helpers ----------
+
 def setup_kaggle():
     if not (KAGGLE_USERNAME and KAGGLE_KEY):
         raise RuntimeError("KAGGLE_USERNAME/KAGGLE_KEY are not set")
@@ -488,7 +450,8 @@ def download_dataset(slug: str) -> Tuple[str, str]:
     return temp_dir, slug
 
 
-# ---------- File reading & upload (same as your code) ----------
+# ---------- File reading & upload ----------
+
 SUPPORTED_TABLE_EXTS = {".csv", ".tsv", ".json", ".parquet", ".xls", ".xlsx"}
 
 
@@ -537,11 +500,9 @@ def connect_fabric_filesystem():
         raise RuntimeError("azure-storage-file-datalake not available")
     if not ONELAKE_URL:
         raise RuntimeError("ONELAKE_URL is not configured")
-    # prefer service principal if available
     tm = TokenManager()
     storage_token = tm.get_token_for_storage()
     if storage_token and CLIENT_SECRET:
-        # if using service principal we can construct DataLakeServiceClient with credential instead of token
         try:
             credential = ClientSecretCredential(
                 tenant_id=TENANT_ID, client_id=CLIENT_ID, client_secret=CLIENT_SECRET
@@ -552,8 +513,6 @@ def connect_fabric_filesystem():
             log.exception(
                 "DataLakeServiceClient with ClientSecretCredential failed; falling back to token"
             )
-    # fallback to token-based client (requires azure sdk support for token credentialless + SAS-like patterns)
-    # For simplicity, use ClientSecretCredential if present. Otherwise raise error.
     raise RuntimeError(
         "Could not create DataLakeServiceClient: ensure azure.identity available and CLIENT_SECRET configured"
     )
@@ -583,7 +542,6 @@ def upload_to_fabric(temp_root: str, workspace_id: str, lakehouse_id: str) -> Di
                             table_local_dir.mkdir(parents=True, exist_ok=True)
                             try:
                                 if write_deltalake is None:
-                                    # fallback: write parquet if deltalake missing
                                     parquet_path = table_local_dir / f"{safe_table_name}.parquet"
                                     df.to_parquet(str(parquet_path), index=False)
                                 else:
@@ -637,6 +595,7 @@ def upload_to_fabric(temp_root: str, workspace_id: str, lakehouse_id: str) -> Di
 
 
 # ---------- Pipeline runner ----------
+
 def run_pipeline(workspace_id: str, pipeline_id: str, parameters: Dict[str, str]) -> Dict:
     tm = TokenManager()
     fabric_token = tm.get_token_for_fabric()
@@ -699,10 +658,7 @@ def check_table_exists(workspace_id: str, lakehouse_id: str, table_name: str) ->
     if not token:
         return False
 
-    # Fabric SQL query endpoint
     url = f"{FABRIC_API_BASE}/workspaces/{workspace_id}/lakehouses/{lakehouse_id}/sql/query"
-
-    # SQL to check table
     sql = f"""
         SELECT name
         FROM sys.tables
@@ -741,7 +697,8 @@ def table_exists_via_api(workspace_id: str, lakehouse_id: str, table_name: str) 
     return False
 
 
-# ---------- Notebook cell (string) ----------
+# ---------- Notebook cell placeholder ----------
+
 notebook_parameters_cell = r"""
 # Parameters
 sourceTable = "default_source_table_name"
@@ -750,31 +707,12 @@ destinationTable = "default_destination_name"
 # (the rest of your notebook parameter cell)
 """
 
-# ---------- Flask app & endpoints ----------
+# ---------- Flask app ----------
+
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-
-@app.route("/health", methods=["GET"])
-def health():
-    """
-    Simple health endpoint for platform checks. Returns 200 quickly.
-    """
-    return jsonify({"status": "ok"}), 200
-
-
-@app.route("/ready", methods=["GET"])
-def ready():
-    """
-    Readiness probe — also returns 200 when app is up.
-    """
-    return jsonify({"ready": True}), 200
-
-
-@app.route("/version", methods=["GET"])
-def version():
-    return jsonify({"app": "combined-api", "version": os.getenv("APP_VERSION", "1.0.0")})
-
+# ---------- Core API endpoints (original app.py) ----------
 
 @app.route("/workspaces", methods=["GET"])
 def api_workspaces():
@@ -786,7 +724,6 @@ def api_workspaces():
     return jsonify({"value": ws})
 
 
-# keep existing query-parameter endpoint (existing frontend code uses this)
 @app.route("/lakehouses", methods=["GET"])
 def api_lakehouses():
     workspace_id = request.args.get("workspace_id")
@@ -800,7 +737,6 @@ def api_lakehouses():
     return jsonify({"value": l})
 
 
-# NEW: compatibility route (some frontends call /workspaces/<id>/lakehouses)
 @app.route("/workspaces/<ws_id>/lakehouses", methods=["GET"])
 def api_lakehouses_ws_path(ws_id):
     if not ws_id:
@@ -864,7 +800,6 @@ def api_search():
 
 @app.route("/import", methods=["POST"])
 def api_import():
-    # robust JSON parsing: accept application/json and also fallback
     try:
         data = request.get_json(force=True, silent=True) or {}
     except Exception:
@@ -872,7 +807,6 @@ def api_import():
     slugs = data.get("slugs")
     workspace_id = data.get("workspace_id")
     lakehouse_id = data.get("lakehouse_id")
-    # Accept single "slug" also
     if not slugs and data.get("slug"):
         slugs = [data.get("slug")]
     if not slugs or not isinstance(slugs, list):
@@ -880,7 +814,6 @@ def api_import():
     if not workspace_id or not lakehouse_id:
         return jsonify({"error": "workspace_id & lakehouse_id are required"}), 400
 
-    # Log incoming payload for easier debugging (your frontend should show this payload in devtools as well)
     log.info(
         "[IMPORT] payload received: slugs=%s workspace_id=%s lakehouse_id=%s",
         slugs,
@@ -920,7 +853,7 @@ def api_run_pipeline():
 
     workspace_id = data.get("workspace_id")
     pipeline_id = data.get("pipeline_id")
-    lakehouse_id = data.get("lakehouse_id")  # IMPORTANT
+    lakehouse_id = data.get("lakehouse_id")
     source_table = data.get("sourceTable") or data.get("source")
     destination_table = data.get("destinationTable") or data.get("destination")
 
@@ -943,7 +876,6 @@ def api_run_pipeline():
     params = {"sourceTable": source_table, "destinationTable": destination_table}
     start_res = run_pipeline(workspace_id, pipeline_id, params)
 
-    # Attach lakehouse id + destination table for follow-up polling
     start_res["lakehouse_id"] = lakehouse_id
     start_res["destination_table"] = destination_table
 
@@ -960,10 +892,8 @@ def debug_tables():
     if not token:
         return {"error": "no storage token"}, 500
 
-    # IMPORTANT: Only list "Tables" root folder
     paths = list_onelake_paths(workspace_id, lakehouse_id, "Tables", token, recursive=True)
     return jsonify(paths)
-
 
 
 @app.route("/poll-job", methods=["GET"])
@@ -986,10 +916,7 @@ def api_poll_job():
     status_res = poll_job_status(location)
     job_status = status_res.get("status")
 
-    # treat completed as success
     if job_status and job_status.lower() in ("succeeded", "completed"):
-
-        # **IMPORTANT**: DO NOT normalize name here
         exists = table_exists_via_api(workspace_id, lakehouse_id, destination_table)
 
         if exists:
@@ -1012,17 +939,8 @@ def api_poll_job():
     return jsonify(status_res)
 
 
-# ---------- Prediction endpoints (Option A: API-ified logic from apps.py) ----------
 @app.route("/prediction/columns", methods=["GET"])
 def api_prediction_columns():
-    """
-    Return real columns for a given table.
-
-    Priority:
-    1. Try Fabric Metadata API  (SQL-registered tables)
-    2. If API returns [], fallback to Delta Lake _delta_log schema (OneLake-only tables)
-    """
-
     workspace_id = request.args.get("workspace_id")
     lakehouse_id = request.args.get("lakehouse_id")
     table_name = request.args.get("table_name")
@@ -1039,13 +957,9 @@ def api_prediction_columns():
     if not fabric_token:
         return jsonify({"error": "could not acquire fabric token"}), 500
 
-    # 1️⃣ Try metadata API first
     columns = get_table_columns(workspace_id, lakehouse_id, table_name, fabric_token)
-
-    # Debug log
     print(f"[DEBUG] API columns for {table_name} →", columns)
 
-    # 2️⃣ If no columns → check delta_log
     if not columns:
         if not storage_token:
             print("[DEBUG] No storage token → cannot fetch delta columns.")
@@ -1067,16 +981,6 @@ def api_prediction_columns():
 
 @app.route("/prediction/pipelines", methods=["GET"])
 def api_prediction_pipelines():
-    """
-    List prediction-oriented pipelines for a workspace.
-
-    Implements the same heuristic as apps.py:
-      - Prefer pipelines whose displayName or name contains one of:
-        'pred', 'forecast', 'ml', 'model' (case-insensitive)
-      - If no such pipelines exist, returns all pipelines.
-    Query params:
-      - workspace_id
-    """
     workspace_id = request.args.get("workspace_id")
     if not workspace_id:
         return jsonify({"error": "workspace_id is required"}), 400
@@ -1092,9 +996,6 @@ def api_prediction_pipelines():
 
 @app.route("/prediction/launch", methods=["POST"])
 def api_prediction_launch():
-    """
-    Launch a prediction pipeline programmatically.
-    """
     try:
         data = request.get_json(force=True, silent=True) or {}
     except Exception:
@@ -1115,10 +1016,8 @@ def api_prediction_launch():
             400,
         )
 
-    # Reuse your existing run_pipeline() logic
     result = run_pipeline(workspace_id, pipeline_id, parameters)
 
-    # Attach lakehouse_id + destinationTable (if provided) for polling
     if lakehouse_id:
         result["lakehouse_id"] = lakehouse_id
 
@@ -1138,7 +1037,517 @@ def api_notebook_cell():
     return jsonify({"cell": notebook_parameters_cell})
 
 
+# ---------- Semantic model / report helpers (from new11.py) ----------
+
+def load_credentials(path="credentials.json"):
+    if not os.path.exists(path):
+        raise ValueError("Missing credentials.json")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    req = ["tenant_id", "client_id", "client_secret", "ado_org", "ado_project", "ado_repo", "ado_pat"]
+    missing = [k for k in req if k not in data or not data[k]]
+    if missing:
+        raise ValueError(f"Missing keys in credentials.json: {missing}")
+    return data
+
+
+def get_token(tenant, client, secret, scope):
+    url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    r = requests.post(
+        url,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client,
+            "client_secret": secret,
+            "scope": scope,
+        },
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Token error: {r.status_code} - {r.text[:2000]}")
+    return r.json().get("access_token")
+
+
+def ado_list_items(org, project, repo, path, pat):
+    api_version = "7.1-preview.1"
+    url = f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/items"
+    params = {"scopePath": path, "recursionLevel": "Full", "includeContent": "false", "api-version": api_version}
+    r = requests.get(url, params=params, auth=HTTPBasicAuth('', pat))
+    if r.status_code >= 300:
+        raise RuntimeError(f"ADO list failed: {r.status_code} - {r.text[:1000]}")
+    return r.json().get("value", [])
+
+
+def ado_get_item_content(org, project, repo, item_path, pat):
+    api_version = "7.1-preview.1"
+    url = f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/items"
+    params = {"path": item_path, "api-version": api_version, "includeContent": "true"}
+    r = requests.get(url, params=params, auth=HTTPBasicAuth('', pat))
+    if r.status_code == 200:
+        try:
+            jr = r.json()
+            if "content" in jr:
+                return base64.b64decode(jr["content"])
+            return json.dumps(jr, indent=2).encode("utf-8")
+        except Exception:
+            return r.content
+    raise RuntimeError(f"ADO get content failed: {r.status_code} - {r.text[:1000]}")
+
+
+def ado_search_for_tmdls(org, project, repo, pat):
+    items = ado_list_items(org, project, repo, "", pat)
+    if not items:
+        return []
+    return [it for it in items if it.get("path", "").lower().endswith(".tmdl")]
+
+
+def trigger_pipeline(fabric_token, params=None):
+    url = f"{FABRIC_BASE}/workspaces/{WORKSPACE_ID}/items/{PIPELINE_ID}/jobs/Pipeline/instances"
+    headers = {"Authorization": f"Bearer {fabric_token}", "Content-Type": "application/json"}
+    body = {"executionData": {"parameters": params}} if params else {}
+    r = requests.post(url, headers=headers, json=body)
+    if r.status_code != 202:
+        raise RuntimeError(f"Pipeline trigger failed: {r.status_code} - {r.text[:2000]}")
+    loc = r.headers.get("Location")
+    run_id = loc.rstrip("/").split("/")[-1]
+    return run_id
+
+
+def poll_pipeline(fabric_token, run_id, timeout=PIPELINE_POLL_TIMEOUT, interval=PIPELINE_POLL_INTERVAL):
+    url = f"{FABRIC_BASE}/workspaces/{WORKSPACE_ID}/items/{PIPELINE_ID}/jobs/instances/{run_id}"
+    headers = {"Authorization": f"Bearer {fabric_token}"}
+    waited = 0
+    while waited < timeout:
+        r = requests.get(url, headers=headers)
+        if r.status_code == 200:
+            data = r.json()
+            status = data.get("status")
+            if status in ("Succeeded", "Completed"):
+                return data
+            if status in ("Failed", "Error", "Cancelled"):
+                raise RuntimeError(f"Pipeline failed: {json.dumps(data, indent=2)[:3000]}")
+        else:
+            print(f"Warning: pipeline status fetch returned {r.status_code}")
+        time.sleep(interval)
+        waited += interval
+    raise RuntimeError("Pipeline poll timed out")
+
+
+def _unescape_string(s):
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.strip()
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1]
+    try:
+        s = s.encode('utf-8').decode('unicode_escape')
+    except Exception:
+        s = s.replace("\\\\", "\\").replace('\\"', '"').replace("\\'", "'")
+    return s
+
+
+def clean_columns(cols):
+    if not cols:
+        return None
+    cleaned = []
+    for c in cols:
+        c_str = _unescape_string(c)
+        c_str = c_str.replace('"', '').replace("'", "").replace("\\", "").strip()
+        if c_str:
+            cleaned.append(c_str)
+    seen = set()
+    out = []
+    for x in cleaned:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out if out else None
+
+
+def get_pipeline_activities(fabric_token, run_id, pipeline_data):
+    url = f"{FABRIC_BASE}/workspaces/{WORKSPACE_ID}/datapipelines/pipelineruns/{run_id}/queryactivityruns"
+    headers = {"Authorization": f"Bearer {fabric_token}", "Content-Type": "application/json"}
+    run_start_str = pipeline_data.get('result', {}).get('runStartTime')
+    if run_start_str:
+        try:
+            run_start = datetime.fromisoformat(run_start_str.replace('Z', '+00:00'))
+            last_updated_after = (run_start - timedelta(minutes=5)).isoformat().replace('+00:00', 'Z')
+        except Exception:
+            last_updated_after = (datetime.utcnow() - timedelta(hours=1)).isoformat() + 'Z'
+    else:
+        last_updated_after = (datetime.utcnow() - timedelta(hours=1)).isoformat() + 'Z'
+    last_updated_before = datetime.utcnow().isoformat() + 'Z'
+    body = {
+        "filters": [],
+        "orderBy": [{"orderBy": "ActivityRunStart", "order": "DESC"}],
+        "lastUpdatedAfter": last_updated_after,
+        "lastUpdatedBefore": last_updated_before,
+    }
+    r = requests.post(url, headers=headers, json=body)
+    if r.status_code != 200:
+        raise RuntimeError(f"Failed to query activity runs: {r.status_code} - {r.text[:2000]}")
+    payload = r.json()
+    activities = payload if isinstance(payload, list) else payload.get("value", [])
+    return activities
+
+
+def extract_columns_from_activity_output(activity_output, table_name):
+    candidates = []
+    if isinstance(activity_output, dict):
+        for k in ("result", "output", "exitValue", "message", "details"):
+            v = activity_output.get(k)
+            if v:
+                candidates.append(v if isinstance(v, str) else json.dumps(v))
+        if activity_output.get("result") and isinstance(activity_output["result"], dict):
+            for k in ("exitValue", "output", "message"):
+                v = activity_output["result"].get(k)
+                if v:
+                    candidates.append(v if isinstance(v, str) else json.dumps(v))
+    else:
+        candidates.append(str(activity_output))
+    for cand in candidates:
+        s = cand if isinstance(cand, str) else json.dumps(cand)
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                if "columns" in parsed and isinstance(parsed["columns"], list):
+                    return parsed["columns"]
+                if "error" in parsed and isinstance(parsed["error"], str):
+                    s = parsed["error"]
+                else:
+                    s = json.dumps(parsed)
+            elif isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+                return parsed
+        except Exception:
+            pass
+        patterns = [
+            rf"Table\s+'{re.escape(table_name)}'\s+not found or could be read:\s*(\[[^\]]+\])",
+            rf"Table\s+'{re.escape(table_name)}'\s+not found or could not be read:\s*(\[[^\]]+\])",
+            r"columns\s*[:=]\s*(\[[^\]]+\])",
+            r"Columns\s*[:=]\s*(\[[^\]]+\])",
+            r"(\[[\s\r\n]*\"[^\]]+\"\s*\])",
+        ]
+        for patt in patterns:
+            m = re.search(patt, s, re.IGNORECASE | re.DOTALL)
+            if m:
+                txt = m.group(1)
+                try:
+                    arr = json.loads(txt)
+                    return arr
+                except Exception:
+                    inner = txt.strip().lstrip("[").rstrip("]")
+                    parts = [p.strip().strip('"').strip("'") for p in inner.split(",") if p.strip()]
+                    if parts:
+                        return parts
+        any_arr = re.search(r"(\[[\s\S]{1,2000}?\])", s)
+        if any_arr:
+            try:
+                arr = json.loads(any_arr.group(1))
+                if isinstance(arr, list):
+                    return arr
+            except Exception:
+                pass
+    return None
+
+
+def get_columns_from_pipeline(fabric_token, run_id, table_name, pipeline_data):
+    activities = get_pipeline_activities(fabric_token, run_id, pipeline_data)
+    for act in activities:
+        if act.get("activityType") == "TridentNotebook":
+            output = act.get("output") or act.get("result") or act
+            cols = extract_columns_from_activity_output(output, table_name)
+            if cols:
+                return cols
+    root_exit = pipeline_data.get("result", {}).get("exitValue") or pipeline_data.get("result", {}).get("output")
+    if root_exit:
+        try:
+            parsed = json.loads(root_exit)
+            if isinstance(parsed, dict) and "error" in parsed and isinstance(parsed["error"], str):
+                arrm = re.search(r"(\[[^\]]+\])", parsed["error"])
+                if arrm:
+                    try:
+                        return json.loads(arrm.group(1))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return None
+
+
+def _find_table_block_indices_legacy(text, table_name):
+    m = re.search(r'^\s*table\s+' + re.escape(table_name) + r'\s*$', text, flags=re.MULTILINE)
+    if not m:
+        m_any = re.search(r'^\s*table\s+\w+\s*$', text, flags=re.MULTILINE)
+        if not m_any:
+            return (None, None)
+        start = m_any.start()
+    else:
+        start = m.start()
+    part = re.search(r'^\s*partition\s+' + re.escape(table_name) + r'\b', text[start:], flags=re.MULTILINE)
+    if part:
+        part_start = start + part.start()
+        next_table = re.search(r'^\s*table\s+\w+\s*$', text[part_start + 1 :], flags=re.MULTILINE)
+        if next_table:
+            part_end = part_start + 1 + next_table.start()
+        else:
+            part_end = len(text)
+        return (start, part_start, part_start, part_end)
+    else:
+        next_table = re.search(r'^\s*table\s+\w+\s*$', text[start + 1 :], flags=re.MULTILINE)
+        if next_table:
+            end = start + 1 + next_table.start()
+        else:
+            end = len(text)
+        return (start, end, None, None)
+
+
+def transform_golden_legacy(golden_bytes, old_name, new_name, columns=None):
+    text = golden_bytes.decode('utf-8', errors='replace')
+    if not columns:
+        new_text = text.replace(old_name, new_name)
+        new_text = re.sub(
+            r'(Item\s*=\s*")Files?/[^"]*(")',
+            rf'\1Files/{new_name}\2',
+            new_text,
+            flags=re.IGNORECASE,
+        )
+        new_text = re.sub(
+            r'(\blineageTag\s*:\s*)([^\r\n]+)',
+            lambda m: f"{m.group(1)}{uuid.uuid4()}",
+            new_text,
+            flags=re.IGNORECASE,
+        )
+        return new_text.encode('utf-8')
+
+    res = _find_table_block_indices_legacy(text, old_name)
+    if not res or res[0] is None:
+        print("Could not find original table block; falling back to rename-only.")
+        return transform_golden_legacy(golden_bytes, old_name, new_name, columns=None)
+    table_start, table_end, part_start, part_end = res
+
+    lines = []
+    lines.append(f"table {new_name}")
+    lines.append(f"\tlineageTag: {uuid.uuid4()}")
+    lines.append(f"\tsourceLineageTag: [dbo].[{new_name}]")
+    lines.append("")
+
+    for col in columns:
+        col_guid = uuid.uuid4()
+        lines.append(f"\tcolumn {col}")
+        lines.append(f"\t\tdataType: string")
+        lines.append(f"\t\tlineageTag: {col_guid}")
+        lines.append(f"\t\tsourceLineageTag: {col}")
+        lines.append(f"\t\tsummarizeBy: none")
+        lines.append(f"\t\tsourceColumn: {col}")
+        lines.append("")
+        lines.append(f"\t\tannotation SummarizationSetBy = Automatic")
+        lines.append("")
+
+    lines.append(f"\tpartition {new_name} = entity")
+    lines.append(f"\t\tmode: directLake")
+    lines.append(f"\t\tsource")
+    lines.append(f"\t\t\tentityName: {new_name}")
+    lines.append(f"\t\t\texpressionSource: 'DirectLake - DataLakehouse'")
+    new_block = "\n".join(lines) + "\n"
+
+    if part_start is not None:
+        tail = text[part_end:]
+    else:
+        tail = text[table_end:]
+    prefix = text[:table_start]
+    new_text = prefix + new_block + tail
+
+    new_text = new_text.replace(old_name, new_name)
+    new_text = re.sub(
+        r'(\blineageTag\s*:\s*)([^\r\n]+)',
+        lambda m: f"{m.group(1)}{uuid.uuid4()}",
+        new_text,
+        flags=re.IGNORECASE,
+    )
+    new_text = re.sub(
+        r'(Item\s*=\s*")Files?/[^"]*(")',
+        rf'\1Files/{new_name}\2',
+        new_text,
+        flags=re.IGNORECASE,
+    )
+
+    return new_text.encode('utf-8')
+
+
+def build_parts_from_ado(creds, new_table_name, columns=None):
+    items = ado_list_items(
+        creds["ado_org"], creds["ado_project"], creds["ado_repo"], ADO_TEMPLATE_PATH, creds["ado_pat"]
+    )
+    parts = []
+    golden = None
+    for item in items:
+        if item.get("isFolder"):
+            continue
+        rel = item["path"][len(ADO_TEMPLATE_PATH):].lstrip("/\\").replace("\\", "/")
+        content = ado_get_item_content(
+            creds["ado_org"],
+            creds["ado_project"],
+            creds["ado_repo"],
+            item["path"],
+            creds["ado_pat"],
+        )
+        if rel == GOLDEN_TABLE_REL:
+            golden = content
+            continue
+        parts.append(
+            {
+                "path": rel,
+                "payload": base64.b64encode(content).decode('utf-8'),
+                "payloadType": "InlineBase64",
+            }
+        )
+    if golden is None:
+        cand = ado_search_for_tmdls(
+            creds["ado_org"], creds["ado_project"], creds["ado_repo"], creds["ado_pat"]
+        )
+        if not cand:
+            raise RuntimeError("No .tmdl found")
+        golden = ado_get_item_content(
+            creds["ado_org"], creds["ado_project"], creds["ado_repo"], cand[0]["path"], creds["ado_pat"]
+        )
+
+    transformed = transform_golden_legacy(golden, GOLDEN_TABLE_NAME, new_table_name, columns=columns)
+    parts.append(
+        {
+            "path": f"definition/tables/{new_table_name}.tmdl",
+            "payload": base64.b64encode(transformed).decode('utf-8'),
+            "payloadType": "InlineBase64",
+        }
+    )
+    return parts
+
+
+def upload_parts_to_fabric(fabric_token, display_name, parts):
+    endpoint = f"{FABRIC_BASE}/workspaces/{WORKSPACE_ID}/semanticModels"
+    headers = {"Authorization": f"Bearer {fabric_token}", "Content-Type": "application/json"}
+    body = {"displayName": display_name, "definition": {"parts": parts}}
+    r = requests.post(endpoint, headers=headers, json=body)
+    if r.status_code not in (200, 201, 202):
+        raise RuntimeError(f"Upload failed: {r.text[:2000]}")
+    status_url = r.headers.get("Location") or r.headers.get("location")
+    if not status_url:
+        return None
+    for _ in range(MODEL_POLL_ATTEMPTS):
+        time.sleep(MODEL_POLL_INTERVAL)
+        pr = requests.get(status_url, headers=headers)
+        if pr.status_code != 200:
+            continue
+        pj = pr.json()
+        st = pj.get("status")
+        if st == "Succeeded":
+            return pj.get("result", {}).get("resourceId")
+        if st == "Failed":
+            raise RuntimeError(f"Model create failed: {json.dumps(pj.get('error', {}), indent=2)}")
+    raise RuntimeError("Model create timed out")
+
+
+def find_pbi_dataset(pbi_token, name):
+    url = f"{PBI_BASE}/groups/{WORKSPACE_ID}/datasets"
+    r = requests.get(url, headers={"Authorization": f"Bearer {pbi_token}"})
+    if r.status_code != 200:
+        raise RuntimeError(f"Failed to list datasets: {r.status_code}")
+    for ds in r.json().get("value", []):
+        if ds.get("name") == name:
+            return ds.get("id")
+    return None
+
+
+def clone_pbi_report(pbi_token, template_id, dataset_id, new_name):
+    url = f"{PBI_BASE}/groups/{WORKSPACE_ID}/reports/{template_id}/Clone"
+    body = {"name": new_name, "targetModelId": dataset_id, "targetWorkspaceId": WORKSPACE_ID}
+    r = requests.post(
+        url,
+        json=body,
+        headers={"Authorization": f"Bearer {pbi_token}", "Content-Type": "application/json"},
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Report clone failed: {r.status_code} - {r.text[:2000]}")
+    return r.json()
+
+
+def execute_model_creation(
+    new_table,
+    model_display=None,
+    report_name=None,
+    template_report_id=TEMPLATE_REPORT_ID,
+    should_trigger=False,
+):
+    creds = load_credentials()
+    fabric_token = get_token(creds["tenant_id"], creds["client_id"], creds["client_secret"], FABRIC_SCOPE)
+    pbi_token = get_token(creds["tenant_id"], creds["client_id"], creds["client_secret"], PBI_SCOPE)
+
+    model_display = model_display or f"{new_table} SM"
+    report_name = report_name or f"{new_table} R"
+
+    columns = None
+    if should_trigger:
+        run_id = trigger_pipeline(fabric_token, params={"table_name": new_table})
+        pipeline_data = poll_pipeline(fabric_token, run_id)
+        raw_cols = get_columns_from_pipeline(fabric_token, run_id, new_table, pipeline_data)
+        columns = clean_columns(raw_cols)
+
+    parts = build_parts_from_ado(creds, new_table, columns=columns)
+    model_id = upload_parts_to_fabric(fabric_token, model_display, parts)
+    time.sleep(20)
+    dataset_id = find_pbi_dataset(pbi_token, model_display)
+    if not dataset_id:
+        raise RuntimeError("Dataset not found")
+    clone_res = clone_pbi_report(pbi_token, template_report_id, dataset_id, report_name)
+    return {
+        "model_id": model_id,
+        "dataset_id": dataset_id,
+        "report_url": clone_res.get("webUrl"),
+        "cleaned_columns": columns,
+        "success": True,
+    }
+
+
+# ---------- Extra routes from new11.py (integrated) ----------
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "healthy"})
+
+
+@app.route("/create-model", methods=["POST"])
+def create_model():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON body provided"}), 400
+
+        new_table = data.get("new_table")
+        if not new_table:
+            return jsonify({"error": "Missing required field: new_table"}), 400
+
+        model_display = data.get("model_display")
+        report_name = data.get("report_name")
+        template_report_id = data.get("template_report_id", TEMPLATE_REPORT_ID)
+        should_trigger = data.get("should_trigger", False)
+
+        result = execute_model_creation(
+            new_table=new_table,
+            model_display=model_display,
+            report_name=report_name,
+            template_report_id=template_report_id,
+            should_trigger=should_trigger,
+        )
+        return jsonify(result), 200
+
+    except ValueError as e:
+        return jsonify({"error": str(e), "success": False}), 400
+    except RuntimeError as e:
+        return jsonify({"error": str(e), "success": False}), 500
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {str(e)}", "success": False}), 500
+
+
 # ---------- Run ----------
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     log.info("Starting combined API on port %s", port)
