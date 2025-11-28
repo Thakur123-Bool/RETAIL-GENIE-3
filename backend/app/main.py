@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import tempfile
 import shutil
@@ -95,6 +96,9 @@ class TokenManager:
     """
     If CLIENT_SECRET present -> uses ClientSecretCredential (service principal).
     Otherwise falls back to MSAL device-flow (interactive).
+
+    NOTE: in non-interactive environments (no TTY), device-flow will not be attempted
+    to avoid blocking startup — get_token will return None instead.
     """
     _instance = None
 
@@ -195,14 +199,25 @@ class TokenManager:
                 self._save_cache()
                 return token
 
-        # device flow
-        flow = self.app.initiate_device_flow(scopes=scopes)
+        # SAFETY: If running non-interactive (no TTY / container), do NOT start device flow
+        # to avoid blocking the process during deployment. Instead return None.
+        noninteractive_flag = os.environ.get("NONINTERACTIVE", "").lower() in ("1", "true", "yes")
+        if noninteractive_flag or not sys.stdin or not sys.stdin.isatty():
+            log.error("Non-interactive environment detected — skipping device-flow auth.")
+            return None
+
+        # device flow (interactive)
+        try:
+            flow = self.app.initiate_device_flow(scopes=scopes)
+        except Exception:
+            flow = None
+
         if not flow:
             log.error("Failed to start device flow")
             return None
         print("\n=== DEVICE CODE AUTH ===")
-        print(f"Visit: {flow['verification_uri']}")
-        print(f"Code : {flow['user_code']}")
+        print(f"Visit: {flow.get('verification_uri') or flow.get('verification_uri_complete')}")
+        print(f"Code : {flow.get('user_code')}")
         input("After signing in, press Enter to continue...")
         res = self.app.acquire_token_by_device_flow(flow)
         if "access_token" not in res:
@@ -363,6 +378,7 @@ def get_table_columns(
             return []
     log.info("Could not fetch columns for table %s", table_name)
     return []
+
 
 def get_delta_columns_from_onelake(workspace_id, lakehouse_id, table_name, storage_token):
     """
@@ -739,6 +755,27 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    """
+    Simple health endpoint for platform checks. Returns 200 quickly.
+    """
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/ready", methods=["GET"])
+def ready():
+    """
+    Readiness probe — also returns 200 when app is up.
+    """
+    return jsonify({"ready": True}), 200
+
+
+@app.route("/version", methods=["GET"])
+def version():
+    return jsonify({"app": "combined-api", "version": os.getenv("APP_VERSION", "1.0.0")})
+
+
 @app.route("/workspaces", methods=["GET"])
 def api_workspaces():
     tm = TokenManager()
@@ -976,44 +1013,6 @@ def api_poll_job():
 
 
 # ---------- Prediction endpoints (Option A: API-ified logic from apps.py) ----------
-
-
-# @app.route("/prediction/columns", methods=["GET"])
-# def api_prediction_columns():
-#     """
-#     Return real columns for a given table, to help the frontend
-#     build prediction parameters such as:
-#       - dateColumn
-#       - targetColumn
-#       - filterColumn
-#       - selectedColumns
-#     Query params:
-#       - workspace_id
-#       - lakehouse_id
-#       - table_name
-#     """
-#     workspace_id = request.args.get("workspace_id")
-#     lakehouse_id = request.args.get("lakehouse_id")
-#     table_name = request.args.get("table_name")
-
-#     if not (workspace_id and lakehouse_id and table_name):
-#         return (
-#             jsonify(
-#                 {
-#                     "error": "workspace_id, lakehouse_id and table_name are required"
-#                 }
-#             ),
-#             400,
-#         )
-
-#     tm = TokenManager()
-#     fabric_token = tm.get_token_for_fabric()
-#     if not fabric_token:
-#         return jsonify({"error": "could not acquire fabric token"}), 500
-
-#     columns = get_table_columns(workspace_id, lakehouse_id, table_name, fabric_token)
-#     return jsonify({"columns": columns})
-
 @app.route("/prediction/columns", methods=["GET"])
 def api_prediction_columns():
     """
@@ -1066,7 +1065,6 @@ def api_prediction_columns():
     return jsonify({"columns": columns})
 
 
-
 @app.route("/prediction/pipelines", methods=["GET"])
 def api_prediction_pipelines():
     """
@@ -1096,33 +1094,7 @@ def api_prediction_pipelines():
 def api_prediction_launch():
     """
     Launch a prediction pipeline programmatically.
-
-    Body JSON:
-    {
-        "workspace_id": "...",
-        "pipeline_id": "...",
-        "lakehouse_id": "...",   # optional but recommended
-        "parameters": {
-            "sourceTable": "...",
-            "destinationTable": "...",
-            "dateColumn": "...",
-            "targetColumn": "...",
-            "startDate": "...",
-            "endDate": "...",
-            "forecastHorizon": "...",
-            "filterColumn": "...",
-            "productFilters": "...",
-            "selectedColumns": "col1,col2,...",
-            "modelType": "classification" | "regression" | "timeseries",
-            ...
-        }
-    }
-
-    This uses the same parameter structure as the interactive
-    run_prediction_pipeline() from apps.py, but in an API form:
-    your frontend is responsible for choosing columns and values.
     """
-
     try:
         data = request.get_json(force=True, silent=True) or {}
     except Exception:
